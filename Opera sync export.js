@@ -2,8 +2,8 @@
 // @name         Opera sync export
 // @namespace    Sperhak Industries
 // @author       Sperhak
-// @version      1.3
-// @description  Scans your bookmark folders on sync.opera.com, exports them as JSON/HTML/CSV/TXT and opens pages from an exported JSON one by one (Import tab)
+// @version      1.4
+// @description  Scans your bookmark folders on sync.opera.com, exports them as JSON/HTML/CSV/TXT and opens pages from exported files one by one (Import tab)
 // @icon         https://cdn-production-opera-website.operacdn.com/staticfiles/assets/images/favicon/opera/android-chrome-192x192.48af36cc8f36.png
 // @match        *://*.sync.opera.com/*
 // @match        *://auth.opera.com/*
@@ -172,9 +172,11 @@
     await crawl([crumbs()[0].text], out, prog, opts);
   };
 
-  // ---------- import: JSON parsing ----------
-  // Accepts the exported JSON ([{title,url,path}]), a plain array of URLs, or nested {path, items:[...]} nodes
-  const parseImport = text => {
+  // ---------- import: file parsing ----------
+  // Detects the format from the content: JSON, HTML (Netscape bookmarks), CSV (title,url,path) or TXT (one URL per line)
+  const decodeEnt = t => new DOMParser().parseFromString(t, 'text/html').documentElement.textContent;
+
+  const fromJSON = text => {
     const out = [];
     const walk = (v, path) => {
       if (typeof v === 'string') out.push({ title: '', url: v, path });
@@ -185,8 +187,59 @@
         else Object.values(v).forEach(x => walk(x, p));
       }
     };
-    walk(JSON.parse(text.replace(/^\uFEFF/, '')), '');
-    return out.map(x => ({ ...x, url: x.url.trim() })).filter(x => /^https?:\/\//i.test(x.url));
+    walk(JSON.parse(text), '');
+    return out;
+  };
+
+  const fromHTML = text => {
+    const out = [];
+    let folder = '';
+    const re = /<H3[^>]*>([\s\S]*?)<\/H3>|<A\s[^>]*?HREF\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>([\s\S]*?)<\/A>/gi;
+    let m;
+    while ((m = re.exec(text))) {
+      if (m[1] !== undefined) folder = decodeEnt(m[1]).trim();
+      else out.push({ title: decodeEnt(m[4] || '').trim(), url: decodeEnt(m[2] ?? m[3] ?? ''), path: folder });
+    }
+    return out;
+  };
+
+  const csvRows = text => {
+    const rows = []; let row = [], cell = '', q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) {
+        if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+        else cell += c;
+      } else if (c === '"') q = true;
+      else if (c === ',') { row.push(cell); cell = ''; }
+      else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+      else cell += c;
+    }
+    if (cell || row.length) { row.push(cell); rows.push(row); }
+    return rows;
+  };
+  const fromCSV = text => {
+    const rows = csvRows(text);
+    const head = (rows[0] || []).map(x => x.trim().toLowerCase());
+    const iu = head.indexOf('url'), it = head.indexOf('title'), ip = head.indexOf('path');
+    const hasHead = iu >= 0;
+    return rows.slice(hasHead ? 1 : 0).map(r => {
+      const url = hasHead ? r[iu] : r.find(c => /^\s*https?:\/\//i.test(c));
+      return { title: hasHead && it >= 0 ? r[it] || '' : '', url: url || '', path: hasHead && ip >= 0 ? r[ip] || '' : '' };
+    });
+  };
+
+  const fromTXT = text => text.split(/\r?\n/).map(l => (l.match(/https?:\/\/\S+/i) || [''])[0]).map(url => ({ title: '', url, path: '' }));
+
+  const parseImport = text => {
+    text = text.replace(/^\uFEFF/, '');
+    const t = text.trimStart();
+    let out;
+    if (/^[\[{]/.test(t)) out = fromJSON(text);
+    else if (/<A\s[^>]*HREF\s*=/i.test(t)) out = fromHTML(text);
+    else if (/^\s*"?(title|url|path)"?\s*,/i.test(t.split(/\r?\n/, 1)[0]) || /^"/.test(t)) out = fromCSV(text);
+    else out = fromTXT(text);
+    return out.map(x => ({ ...x, url: String(x.url).trim() })).filter(x => /^https?:\/\//i.test(x.url));
   };
 
   // ---------- UI ----------
@@ -304,11 +357,11 @@
 
     // ---------- Import tab ----------
     const inputSt = { padding: '7px', borderRadius: '8px', border: '1px solid ' + C.line, background: C.card, color: '#fff', font: 'inherit', width: '70px' };
-    let raw = [], items = [], pos = 0, running = false, nFiles = 0, loadErr = '';
-    const impStatus = h('div', { color: C.mut, fontSize: '12px', wordBreak: 'break-word', minHeight: '18px' },
-      { textContent: 'Choose one or more JSON files exported from this script.' });
+    let perFile = [], items = [], pos = 0, running = false, loadErr = '';
+    const impStatus = h('div', { color: C.mut, fontSize: '12px', wordBreak: 'break-word', minHeight: '18px', whiteSpace: 'pre-wrap' },
+      { textContent: 'Choose one or more exported files (JSON, HTML, CSV, TXT).' });
     const curLine = h('div', { color: C.fg, fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minHeight: '18px' }, { textContent: '' });
-    const fileIn = h('input', { color: C.fg, font: 'inherit', maxWidth: '100%' }, { type: 'file', multiple: true, accept: '.json,application/json,text/plain' });
+    const fileIn = h('input', { color: C.fg, font: 'inherit', maxWidth: '100%' }, { type: 'file', multiple: true, accept: '.json,.html,.htm,.csv,.txt,application/json,text/html,text/csv,text/plain' });
     const startIn = h('input', inputSt, { type: 'number', min: '1', value: '1' });
     const dedupe = h('input', {}, { type: 'checkbox', checked: true });
     const bgTabs = h('input', {}, { type: 'checkbox', checked: true });
@@ -328,14 +381,25 @@
       resetBtn.disabled = !items.length || running; resetBtn.style.opacity = resetBtn.disabled ? '.5' : '1';
     };
 
-    // Merges all loaded files first, then removes duplicates across all of them
+    // Merges all loaded files in order, removes duplicates across all of them,
+    // then reports every file separately followed by the combined total
     const apply = () => {
       const seen = new Set();
-      items = dedupe.checked ? raw.filter(x => !seen.has(x.url) && seen.add(x.url)) : [...raw];
+      items = [];
+      const lines = [];
+      let total = 0;
+      for (const f of perFile) {
+        for (const x of f.list) {
+          if (dedupe.checked && seen.has(x.url)) continue;
+          seen.add(x.url); items.push(x);
+        }
+        total += f.list.length;
+        lines.push(`• ${f.name}: ${f.list.length} URLs`);
+      }
       pos = 0;
       show();
-      impStatus.textContent = (raw.length
-        ? `Loaded ${raw.length} URLs from ${nFiles} file${nFiles === 1 ? '' : 's'}` + (dedupe.checked ? `, ${raw.length - items.length} duplicates removed → ${items.length} to open.` : '.')
+      impStatus.textContent = (perFile.length
+        ? lines.join('\n') + `\nTotal: ${total} URLs from ${perFile.length} file${perFile.length === 1 ? '' : 's'}` + (dedupe.checked ? `, ${total - items.length} duplicates removed → ${items.length} to open.` : ` → ${items.length} to open.`)
         : 'No valid http(s) URLs found.') + loadErr;
     };
 
@@ -358,14 +422,14 @@
     fileIn.onchange = async () => {
       const files = [...fileIn.files];
       if (!files.length) return;
-      raw = []; nFiles = 0; loadErr = '';
+      perFile = []; loadErr = '';
       for (const f of files) {
-        try { raw.push(...parseImport(await f.text())); nFiles++; }
-        catch (e) { loadErr += ` Skipped ${f.name}: invalid JSON.`; }
+        try { perFile.push({ name: f.name, list: parseImport(await f.text()) }); }
+        catch (e) { loadErr += `\n• ${f.name}: skipped, unreadable file`; }
       }
       apply();
     };
-    dedupe.onchange = () => { if (raw.length && !running) apply(); };
+    dedupe.onchange = () => { if (perFile.length && !running) apply(); };
     startIn.onchange = () => { if (!running && items.length) { pos = Math.min(Math.max((parseInt(startIn.value, 10) || 1) - 1, 0), items.length); show(); } };
     nextBtn.onclick = () => { if (pos < items.length && !running) { if (openOne()) show(); else blockedMsg(); } };
     resetBtn.onclick = () => { pos = 0; show(); };
@@ -411,7 +475,7 @@
     const head = h('div', { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 10px', borderBottom: '1px solid ' + C.line, background: '#111115' }, {},
       h('div', {}, {},
         h('div', { fontWeight: '700' }, { textContent: 'Opera sync export' }),
-        h('div', { color: C.mut, fontSize: '11px' }, { textContent: 'Sperhak Industries' })),
+        h('div', { color: C.mut, fontSize: '11px' }, { textContent: 'Created by Sperhak' })),
       toggle);
 
     const root = h('div', {
