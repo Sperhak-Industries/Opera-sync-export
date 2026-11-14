@@ -2,9 +2,9 @@
 // @name         Opera sync export
 // @namespace    Sperhak Industries
 // @author       Sperhak
-// @version      1.2
+// @version      1.3
 // @description  Scans your bookmark folders on sync.opera.com, exports them as JSON/HTML/CSV/TXT and opens pages from an exported JSON one by one (Import tab)
-// @icon         https://www.sync.opera.com/assets/opera-sync-FixN48YG.png
+// @icon         https://cdn-production-opera-website.operacdn.com/staticfiles/assets/images/favicon/opera/android-chrome-192x192.48af36cc8f36.png
 // @match        *://*.sync.opera.com/*
 // @match        *://auth.opera.com/*
 // @run-at       document-start
@@ -304,12 +304,11 @@
 
     // ---------- Import tab ----------
     const inputSt = { padding: '7px', borderRadius: '8px', border: '1px solid ' + C.line, background: C.card, color: '#fff', font: 'inherit', width: '70px' };
-    let raw = [], items = [], pos = 0, running = false;
+    let raw = [], items = [], pos = 0, running = false, nFiles = 0, loadErr = '';
     const impStatus = h('div', { color: C.mut, fontSize: '12px', wordBreak: 'break-word', minHeight: '18px' },
-      { textContent: 'Choose a JSON file exported from this script.' });
+      { textContent: 'Choose one or more JSON files exported from this script.' });
     const curLine = h('div', { color: C.fg, fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minHeight: '18px' }, { textContent: '' });
-    const fileIn = h('input', { color: C.fg, font: 'inherit', maxWidth: '100%' }, { type: 'file', accept: '.json,application/json,text/plain' });
-    const delayIn = h('input', inputSt, { type: 'number', min: '0', step: '0.5', value: '1' });
+    const fileIn = h('input', { color: C.fg, font: 'inherit', maxWidth: '100%' }, { type: 'file', multiple: true, accept: '.json,application/json,text/plain' });
     const startIn = h('input', inputSt, { type: 'number', min: '1', value: '1' });
     const dedupe = h('input', {}, { type: 'checkbox', checked: true });
     const bgTabs = h('input', {}, { type: 'checkbox', checked: true });
@@ -329,12 +328,15 @@
       resetBtn.disabled = !items.length || running; resetBtn.style.opacity = resetBtn.disabled ? '.5' : '1';
     };
 
+    // Merges all loaded files first, then removes duplicates across all of them
     const apply = () => {
       const seen = new Set();
       items = dedupe.checked ? raw.filter(x => !seen.has(x.url) && seen.add(x.url)) : [...raw];
       pos = 0;
-      impStatus.textContent = raw.length ? `Loaded ${items.length} URLs` + (raw.length !== items.length ? ` (${raw.length - items.length} duplicates removed)` : '') + '.' : 'No valid http(s) URLs found in the file.';
       show();
+      impStatus.textContent = (raw.length
+        ? `Loaded ${raw.length} URLs from ${nFiles} file${nFiles === 1 ? '' : 's'}` + (dedupe.checked ? `, ${raw.length - items.length} duplicates removed → ${items.length} to open.` : '.')
+        : 'No valid http(s) URLs found.') + loadErr;
     };
 
     // Opens one page. Uses Tampermonkey's GM_openInTab (not affected by the popup blocker);
@@ -354,10 +356,14 @@
     const blockedMsg = () => { impStatus.textContent = 'Popup blocked. Allow popups for this site, then continue with "Open next" or "Start".'; };
 
     fileIn.onchange = async () => {
-      const f = fileIn.files[0];
-      if (!f) return;
-      try { raw = parseImport(await f.text()); apply(); }
-      catch (e) { raw = []; items = []; pos = 0; impStatus.textContent = 'Invalid JSON: ' + e.message; show(); }
+      const files = [...fileIn.files];
+      if (!files.length) return;
+      raw = []; nFiles = 0; loadErr = '';
+      for (const f of files) {
+        try { raw.push(...parseImport(await f.text())); nFiles++; }
+        catch (e) { loadErr += ` Skipped ${f.name}: invalid JSON.`; }
+      }
+      apply();
     };
     dedupe.onchange = () => { if (raw.length && !running) apply(); };
     startIn.onchange = () => { if (!running && items.length) { pos = Math.min(Math.max((parseInt(startIn.value, 10) || 1) - 1, 0), items.length); show(); } };
@@ -367,15 +373,13 @@
     startBtn.onclick = async () => { // the first page opens synchronously inside the click, so it is not treated as a popup
       if (running || pos >= items.length) return;
       running = true; show();
-      const delay = Math.max(0, parseFloat(delayIn.value) || 0) * 1000;
       let blocked = false;
       while (running && pos < items.length) {
         const url = items[pos].url;
         if (!openOne()) { blocked = true; break; }
         impStatus.textContent = `Opened ${pos} of ${items.length}…`;
         curLine.textContent = 'Opened: ' + url; curLine.title = url;
-        const t0 = Date.now();
-        while (running && Date.now() - t0 < delay) await sleep(100);
+        await sleep(0); // yield so the UI updates and Pause works
       }
       running = false; show();
       if (blocked) blockedMsg();
@@ -383,8 +387,7 @@
 
     const importPane = h('div', { padding: '10px', display: 'none', flexDirection: 'column', gap: '8px' }, {},
       fileIn, impStatus, curLine,
-      h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Delay (s)' }), delayIn,
-        h('span', { color: C.mut, marginLeft: '8px' }, { textContent: 'Start from #' }), startIn),
+      h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Start from #' }), startIn),
       h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, dedupe, 'Skip duplicate URLs'),
       h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, bgTabs, 'Open in background tabs'),
       h('div', { display: 'flex', gap: '8px' }, {}, startBtn, pauseBtn, nextBtn, resetBtn));
