@@ -2,23 +2,24 @@
 // @name         Opera sync export
 // @namespace    Sperhak Industries
 // @author       Sperhak
-// @version      1.0
-// @description  Načíta priečinky záložiek z sync.opera.com a umožní ich stiahnuť (JSON/HTML/CSV/TXT)
-// @icon         https://sync.opera.com/favicon.ico
+// @version      1.1
+// @description  Scans your bookmark folders on sync.opera.com and lets you export them as JSON/HTML/CSV/TXT
+// @icon         https://www.sync.opera.com/assets/opera-sync-FixN48YG.png
 // @match        *://*.sync.opera.com/*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
 (() => {
   'use strict';
+
   const C = { bg: '#18181c', fg: '#ececf0', mut: '#8d8d99', acc: '#ff1b2d', line: '#2d2d35', card: '#34343d' };
-  const CL = '[class*=_clickable_]';
+  const CL = '[class*=_clickable_]'; // row of a bookmark or a folder
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   let cancel = false, busy = false, nodes = [];
-  window.__opexp = () => nodes;
+  window.__opexp = () => nodes; // handy for debugging from the console
 
-  // ---------- pomocné ----------
+  // ---------- helpers ----------
   const h = (tag, st = {}, props = {}, ...kids) => {
     const e = document.createElement(tag);
     Object.assign(e.style, st);
@@ -26,9 +27,13 @@
     for (const k of kids) e.append(k);
     return e;
   };
+
+  // Extracts a date from a folder name: "D. M. YYYY" or "YYYY-MM-DD" -> "YYYY-MM-DD"
   const dateOf = s => {
-    const m = s.match(/(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/);
-    return m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : '';
+    let m = s.match(/(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})/);
+    if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+    m = s.match(/(\d{4})-(\d{2})-(\d{2})/);
+    return m ? m[0] : '';
   };
   const slug = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'export';
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -40,12 +45,12 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   };
 
-  // ---------- formáty ----------
+  // ---------- export formats ----------
   const flat = ns => ns.flatMap(n => n.items.map(b => ({ title: b.title, url: b.url, path: n.path.join(' / ') })));
   const FORMATS = {
     json: { label: 'JSON', ext: 'json', mime: 'application/json', make: ns => JSON.stringify(flat(ns), null, 1) },
     html: {
-      label: 'HTML (import do prehliadača)', ext: 'html', mime: 'text/html',
+      label: 'HTML (browser import)', ext: 'html', mime: 'text/html',
       make: ns => {
         let o = '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n';
         for (const n of ns) {
@@ -61,13 +66,13 @@
       make: ns => '\uFEFF' + ['title', 'url', 'path'].join(',') + '\r\n' +
         flat(ns).map(r => [r.title, r.url, r.path].map(v => '"' + String(v).replace(/"/g, '""') + '"').join(',')).join('\r\n')
     },
-    txt: { label: 'TXT (len URL)', ext: 'txt', mime: 'text/plain', make: ns => flat(ns).map(r => r.url).join('\n') }
+    txt: { label: 'TXT (URLs only)', ext: 'txt', mime: 'text/plain', make: ns => flat(ns).map(r => r.url).join('\n') }
   };
 
-  // ---------- čítanie stránky ----------
+  // ---------- reading the page ----------
   const getMain = () => document.querySelector('[class*=contentWrapper]') || document.body;
 
-  // breadcrumb: odkazy (rodičia) + posledná položka (_caption_ = aktuálny priečinok)
+  // Breadcrumb: parent folders (role=link) + the last item (_caption_ = current folder)
   const crumbs = () => {
     const box = document.querySelector('[class*=_breadcrumbsContainer_]');
     if (!box) return [];
@@ -77,16 +82,23 @@
       .filter(c => c.text && c.text !== '/');
   };
 
+  // Bookmarks and sub-folders of the currently open folder
   const view = () => {
     const bm = [], folders = [];
     for (const e of getMain().querySelectorAll(CL)) {
       const title = norm(e.querySelector('[class*=_title_]')?.textContent);
       const url = norm(e.querySelector('[class*=_url_]')?.textContent) || e.getAttribute('href') || '';
-      if (url) bm.push({ title, url }); else folders.push({ el: e, title: title || '(bez názvu)' });
+      if (url) bm.push({ title, url });
+      else {
+        const cnt = e.querySelector('[class*=_itemsCount_]');
+        const count = cnt ? parseInt(norm(cnt.textContent), 10) : NaN;
+        folders.push({ el: e, title: title || '(untitled)', count });
+      }
     }
     return { bm, folders };
   };
 
+  // Signature of the current view, used to detect navigation and "loaded" state
   const sig = () => {
     const items = getMain().querySelectorAll(CL);
     const n = items.length;
@@ -94,64 +106,68 @@
     return { n, s: crumbs().map(c => c.text).join('>') + '|' + n + '|' + t(items[0]) + '|' + t(items[n - 1]) };
   };
 
+  // Wait until the view stops changing (an empty view needs a longer quiet period)
   const stable = async () => {
     const t0 = Date.now();
     let last = '', same = 0;
     while (Date.now() - t0 < 60000) {
-      if (cancel) throw new Error('Zrušené');
+      if (cancel) throw new Error('Cancelled');
       const g = sig();
       same = g.s === last ? same + 1 : 0; last = g.s;
       if (same >= (g.n === 0 ? 16 : 4)) return;
       await sleep(150);
     }
   };
+  // Wait for the view to change after a click, then for it to settle
   const settle = async (prev, tag) => {
     const t0 = Date.now();
     while (sig().s === prev) {
-      if (cancel) throw new Error('Zrušené');
-      if (Date.now() - t0 > 6000) throw new Error('Pohľad sa nezmenil (' + tag + ')');
+      if (cancel) throw new Error('Cancelled');
+      if (Date.now() - t0 > 6000) throw new Error('View did not change (' + tag + ')');
       await sleep(100);
     }
     await stable();
   };
 
-  const crawl = async (path, out, prog) => {
+  // Depth-first walk through the folder tree
+  const crawl = async (path, out, prog, opts) => {
     if (path.length > 8) return;
     const { bm, folders } = view();
     if (bm.length) out.push({ path: [...path], items: bm });
     prog(path, out);
     for (let i = 0; i < folders.length; i++) {
-      const f = view().folders[i];
+      const f = view().folders[i]; // re-query: the DOM is re-rendered after navigating back
       if (!f) break;
+      if (opts.skipZero && f.count === 0) { opts.skipped.push(f.title); continue; }
       const before = sig().s;
       f.el.click();
-      await settle(before, 'vstup do ' + f.title);
-      await crawl([...path, f.title], out, prog);
+      await settle(before, 'entering ' + f.title);
+      await crawl([...path, f.title], out, prog, opts);
       const target = crumbs()[path.length - 1];
-      if (!target) throw new Error('Nenašiel som breadcrumb pre návrat');
+      if (!target) throw new Error('Breadcrumb for going back not found');
       const b2 = sig().s;
       target.el.click();
-      await settle(b2, 'návrat do ' + path[path.length - 1]);
+      await settle(b2, 'going back to ' + path[path.length - 1]);
     }
   };
 
-  const scan = async (out, prog) => {
+  const scan = async (out, prog, opts) => {
     if (!location.pathname.startsWith('/bookmarks')) {
       const a = document.querySelector('a[href="/bookmarks"]');
-      if (!a) throw new Error('Otvorte najprv stránku Bookmarks');
+      if (!a) throw new Error('Open the Bookmarks page first');
       a.click();
       const t0 = Date.now();
       while (!(location.pathname.startsWith('/bookmarks') && crumbs().length)) {
-        if (Date.now() - t0 > 8000) throw new Error('Bookmarks sa neotvorili');
+        if (Date.now() - t0 > 8000) throw new Error('Bookmarks did not open');
         await sleep(200);
       }
     }
     const cr = crumbs();
-    if (!cr.length) throw new Error('Nenašiel som breadcrumb');
-    cr[0].el.click(); // späť na koreň
+    if (!cr.length) throw new Error('Breadcrumb not found');
+    cr[0].el.click(); // go back to the root
     await sleep(300);
     await stable();
-    await crawl([crumbs()[0].text], out, prog);
+    await crawl([crumbs()[0].text], out, prog, opts);
   };
 
   // ---------- UI ----------
@@ -163,22 +179,22 @@
     }, { type: 'button', textContent: label });
 
     const status = h('div', { color: C.mut, fontSize: '12px', wordBreak: 'break-word', minHeight: '18px' },
-      { textContent: 'Otvorte Bookmarks a kliknite na „Načítať priečinky“.' });
-    const scanBtn = btn('Načítať priečinky', true);
+      { textContent: 'Open Bookmarks and click "Load folders".' });
+    const scanBtn = btn('Load folders', true);
     const stop = btn('Stop');
     stop.style.display = 'none';
     const list = h('div', { display: 'none', maxHeight: '36vh', overflowY: 'auto', border: '1px solid ' + C.line, borderRadius: '8px', background: '#1f1f25' });
-    const all = btn('Označiť všetko'), none = btn('Zrušiť výber');
+    const all = btn('Select all'), none = btn('Clear selection');
     const fmtSel = h('select', { flex: '1', padding: '7px', borderRadius: '8px', border: '1px solid ' + C.line, background: C.card, color: '#fff', font: 'inherit' });
     for (const [k, f] of Object.entries(FORMATS)) fmtSel.append(new Option(f.label, k));
     const merge = h('input', {}, { type: 'checkbox' });
-    const go = btn('Nič nie je vybraté', true);
+    const go = btn('Nothing selected', true);
     go.style.width = '100%';
 
     const upd = () => {
       const sel = nodes.filter(n => n.sel);
       const cnt = sel.reduce((a, n) => a + n.items.length, 0);
-      go.textContent = sel.length ? `Stiahnuť (${sel.length} priečinkov, ${cnt} záložiek)` : 'Nič nie je vybraté';
+      go.textContent = sel.length ? `Download (${sel.length} folders, ${cnt} bookmarks)` : 'Nothing selected';
       go.disabled = !sel.length || busy;
       go.style.opacity = go.disabled ? '.5' : '1';
       all.disabled = none.disabled = !nodes.length;
@@ -202,18 +218,26 @@
     };
 
     const total = ns => ns.reduce((a, n) => a + n.items.length, 0);
-    const prog = (path, ns) => { status.textContent = `Skenujem: ${path.join(' / ')} — nájdených ${total(ns)} záložiek v ${ns.length} priečinkoch`; };
+    const prog = (path, ns) => { status.textContent = `Scanning: ${path.join(' / ')} — found ${total(ns)} bookmarks in ${ns.length} folders`; };
+    const skippedTxt = o => o.skipped.length
+      ? ` Skipped (count 0): ${o.skipped.slice(0, 6).join(', ')}${o.skipped.length > 6 ? ' and more (' + o.skipped.length + ')' : ''}.` : '';
 
     scanBtn.onclick = async () => {
       if (busy) return;
       busy = true; cancel = false; nodes = []; render();
       scanBtn.disabled = true; stop.style.display = '';
       const found = [];
+      let opts = { skipZero: true, skipped: [] }; // folders showing a count of 0 are not opened
       try {
-        await scan(found, prog);
-        status.textContent = `Hotovo: ${found.length} priečinkov so záložkami, spolu ${total(found)} záložiek.`;
+        await scan(found, prog, opts);
+        if (!found.length && !cancel) { // safety net: nothing found -> retry without skipping
+          status.textContent = 'Nothing found, retrying without skipping…';
+          opts = { skipZero: false, skipped: [] };
+          await scan(found, prog, opts);
+        }
+        status.textContent = `Done: ${found.length} folders with bookmarks, ${total(found)} bookmarks in total.` + skippedTxt(opts);
       } catch (e) {
-        status.textContent = (e.message === 'Zrušené' ? 'Zrušené. ' : 'Chyba: ' + e.message + '. ') + `Zozbierané: ${total(found)} záložiek.`;
+        status.textContent = (e.message === 'Cancelled' ? 'Cancelled. ' : 'Error: ' + e.message + '. ') + `Collected: ${total(found)} bookmarks.` + skippedTxt(opts);
       } finally {
         busy = false; scanBtn.disabled = false; stop.style.display = 'none';
         nodes = found.map(f => {
@@ -237,7 +261,7 @@
           const base = ns.length === 1 ? fname(ns[0])
             : ds.length ? (ds.length === 1 ? ds[0] : `${ds[0]}_${ds[ds.length - 1]}`) + `_${ns.length}x` : 'merged';
           download(`opera_bookmarks_${base}.${f.ext}`, f.make(ns), f.mime);
-          status.textContent = `Stiahnutý 1 súbor (${total(ns)} záložiek).`;
+          status.textContent = `Downloaded 1 file (${total(ns)} bookmarks).`;
         } else {
           const used = new Map();
           for (const n of ns) {
@@ -246,17 +270,17 @@
             download(`opera_bookmarks_${b}.${f.ext}`, f.make([n]), f.mime);
             await sleep(400);
           }
-          status.textContent = `Stiahnutých ${ns.length} súborov.`;
+          status.textContent = `Downloaded ${ns.length} files.`;
         }
-      } catch (e) { status.textContent = 'Chyba pri sťahovaní: ' + e.message; }
+      } catch (e) { status.textContent = 'Download error: ' + e.message; }
     };
 
     const body = h('div', { padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto' }, {},
       h('div', { display: 'flex', gap: '8px' }, {}, scanBtn, stop),
       status, list,
       h('div', { display: 'flex', gap: '8px' }, {}, all, none),
-      h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Formát' }), fmtSel),
-      h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, merge, 'Spojiť vybrané do jedného súboru'),
+      h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Format' }), fmtSel),
+      h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, merge, 'Merge selected into one file'),
       go);
 
     const toggle = btn('–'); toggle.style.padding = '2px 10px';
@@ -275,5 +299,7 @@
     document.body.append(root);
     upd();
   };
-  const iv = setInterval(() => { try { mk(); if (document.getElementById('opexp')) clearInterval(iv); } catch (e) { /* ticho */ } }, 500);
+
+  // The page is a SPA and we run at document-start, so wait for <body> to exist
+  const iv = setInterval(() => { try { mk(); if (document.getElementById('opexp')) clearInterval(iv); } catch (e) { /* silent */ } }, 500);
 })();
