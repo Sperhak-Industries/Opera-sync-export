@@ -2,12 +2,14 @@
 // @name         Opera sync export
 // @namespace    Sperhak Industries
 // @author       Sperhak
-// @version      1.1
-// @description  Scans your bookmark folders on sync.opera.com and lets you export them as JSON/HTML/CSV/TXT
+// @version      1.2
+// @description  Scans your bookmark folders on sync.opera.com, exports them as JSON/HTML/CSV/TXT and opens pages from an exported JSON one by one (Import tab)
 // @icon         https://www.sync.opera.com/assets/opera-sync-FixN48YG.png
 // @match        *://*.sync.opera.com/*
+// @match        *://auth.opera.com/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_openInTab
+// @grant        unsafeWindow
 // ==/UserScript==
 (() => {
   'use strict';
@@ -17,7 +19,7 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   let cancel = false, busy = false, nodes = [];
-  window.__opexp = () => nodes; // handy for debugging from the console
+  (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__opexp = () => nodes; // handy for debugging from the console
 
   // ---------- helpers ----------
   const h = (tag, st = {}, props = {}, ...kids) => {
@@ -170,6 +172,23 @@
     await crawl([crumbs()[0].text], out, prog, opts);
   };
 
+  // ---------- import: JSON parsing ----------
+  // Accepts the exported JSON ([{title,url,path}]), a plain array of URLs, or nested {path, items:[...]} nodes
+  const parseImport = text => {
+    const out = [];
+    const walk = (v, path) => {
+      if (typeof v === 'string') out.push({ title: '', url: v, path });
+      else if (Array.isArray(v)) v.forEach(x => walk(x, path));
+      else if (v && typeof v === 'object') {
+        const p = Array.isArray(v.path) ? v.path.join(' / ') : (v.path || path);
+        if (typeof v.url === 'string') out.push({ title: v.title || '', url: v.url, path: p });
+        else Object.values(v).forEach(x => walk(x, p));
+      }
+    };
+    walk(JSON.parse(text.replace(/^\uFEFF/, '')), '');
+    return out.map(x => ({ ...x, url: x.url.trim() })).filter(x => /^https?:\/\//i.test(x.url));
+  };
+
   // ---------- UI ----------
   const mk = () => {
     if (document.getElementById('opexp') || !document.body) return;
@@ -275,13 +294,114 @@
       } catch (e) { status.textContent = 'Download error: ' + e.message; }
     };
 
-    const body = h('div', { padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto' }, {},
+    const exportPane = h('div', { padding: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }, {},
       h('div', { display: 'flex', gap: '8px' }, {}, scanBtn, stop),
       status, list,
       h('div', { display: 'flex', gap: '8px' }, {}, all, none),
       h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Format' }), fmtSel),
       h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, merge, 'Merge selected into one file'),
       go);
+
+    // ---------- Import tab ----------
+    const inputSt = { padding: '7px', borderRadius: '8px', border: '1px solid ' + C.line, background: C.card, color: '#fff', font: 'inherit', width: '70px' };
+    let raw = [], items = [], pos = 0, running = false;
+    const impStatus = h('div', { color: C.mut, fontSize: '12px', wordBreak: 'break-word', minHeight: '18px' },
+      { textContent: 'Choose a JSON file exported from this script.' });
+    const curLine = h('div', { color: C.fg, fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minHeight: '18px' }, { textContent: '' });
+    const fileIn = h('input', { color: C.fg, font: 'inherit', maxWidth: '100%' }, { type: 'file', accept: '.json,application/json,text/plain' });
+    const delayIn = h('input', inputSt, { type: 'number', min: '0', step: '0.5', value: '1' });
+    const startIn = h('input', inputSt, { type: 'number', min: '1', value: '1' });
+    const dedupe = h('input', {}, { type: 'checkbox', checked: true });
+    const bgTabs = h('input', {}, { type: 'checkbox', checked: true });
+    const startBtn = btn('Start', true), pauseBtn = btn('Pause'), nextBtn = btn('Open next'), resetBtn = btn('Reset');
+    pauseBtn.style.display = 'none';
+
+    const show = () => {
+      startIn.value = String(Math.min(pos + 1, Math.max(items.length, 1)));
+      const nx = items[pos];
+      if (items.length) impStatus.textContent = pos >= items.length ? `Done: opened ${items.length} of ${items.length}.` : `Opened ${pos} of ${items.length}.`;
+      curLine.textContent = !items.length ? '' : pos >= items.length ? '' : 'Next: ' + nx.url;
+      curLine.title = curLine.textContent;
+      const off = !items.length || pos >= items.length;
+      startBtn.style.display = running ? 'none' : '';
+      pauseBtn.style.display = running ? '' : 'none';
+      for (const b of [startBtn, nextBtn]) { b.disabled = off || running; b.style.opacity = b.disabled ? '.5' : '1'; }
+      resetBtn.disabled = !items.length || running; resetBtn.style.opacity = resetBtn.disabled ? '.5' : '1';
+    };
+
+    const apply = () => {
+      const seen = new Set();
+      items = dedupe.checked ? raw.filter(x => !seen.has(x.url) && seen.add(x.url)) : [...raw];
+      pos = 0;
+      impStatus.textContent = raw.length ? `Loaded ${items.length} URLs` + (raw.length !== items.length ? ` (${raw.length - items.length} duplicates removed)` : '') + '.' : 'No valid http(s) URLs found in the file.';
+      show();
+    };
+
+    // Opens one page. Uses Tampermonkey's GM_openInTab (not affected by the popup blocker);
+    // falls back to window.open. Returns false if the browser blocked it.
+    const openOne = () => {
+      const it = items[pos];
+      if (typeof GM_openInTab === 'function') {
+        try { GM_openInTab(it.url, { active: !bgTabs.checked, insert: true }); pos++; return true; }
+        catch (e) { /* fall through to window.open */ }
+      }
+      const w = window.open(it.url, '_blank');
+      if (!w) return false;
+      try { w.opener = null; } catch (e) { /* cross-origin, ignore */ }
+      pos++;
+      return true;
+    };
+    const blockedMsg = () => { impStatus.textContent = 'Popup blocked. Allow popups for this site, then continue with "Open next" or "Start".'; };
+
+    fileIn.onchange = async () => {
+      const f = fileIn.files[0];
+      if (!f) return;
+      try { raw = parseImport(await f.text()); apply(); }
+      catch (e) { raw = []; items = []; pos = 0; impStatus.textContent = 'Invalid JSON: ' + e.message; show(); }
+    };
+    dedupe.onchange = () => { if (raw.length && !running) apply(); };
+    startIn.onchange = () => { if (!running && items.length) { pos = Math.min(Math.max((parseInt(startIn.value, 10) || 1) - 1, 0), items.length); show(); } };
+    nextBtn.onclick = () => { if (pos < items.length && !running) { if (openOne()) show(); else blockedMsg(); } };
+    resetBtn.onclick = () => { pos = 0; show(); };
+    pauseBtn.onclick = () => { running = false; };
+    startBtn.onclick = async () => { // the first page opens synchronously inside the click, so it is not treated as a popup
+      if (running || pos >= items.length) return;
+      running = true; show();
+      const delay = Math.max(0, parseFloat(delayIn.value) || 0) * 1000;
+      let blocked = false;
+      while (running && pos < items.length) {
+        const url = items[pos].url;
+        if (!openOne()) { blocked = true; break; }
+        impStatus.textContent = `Opened ${pos} of ${items.length}…`;
+        curLine.textContent = 'Opened: ' + url; curLine.title = url;
+        const t0 = Date.now();
+        while (running && Date.now() - t0 < delay) await sleep(100);
+      }
+      running = false; show();
+      if (blocked) blockedMsg();
+    };
+
+    const importPane = h('div', { padding: '10px', display: 'none', flexDirection: 'column', gap: '8px' }, {},
+      fileIn, impStatus, curLine,
+      h('div', { display: 'flex', gap: '8px', alignItems: 'center' }, {}, h('span', { color: C.mut }, { textContent: 'Delay (s)' }), delayIn,
+        h('span', { color: C.mut, marginLeft: '8px' }, { textContent: 'Start from #' }), startIn),
+      h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, dedupe, 'Skip duplicate URLs'),
+      h('label', { display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer' }, {}, bgTabs, 'Open in background tabs'),
+      h('div', { display: 'flex', gap: '8px' }, {}, startBtn, pauseBtn, nextBtn, resetBtn));
+    show();
+
+    // ---------- Tabs ----------
+    const tabExp = btn('Export', true), tabImp = btn('Import');
+    const setTab = t => {
+      exportPane.style.display = t === 'exp' ? 'flex' : 'none';
+      importPane.style.display = t === 'imp' ? 'flex' : 'none';
+      tabExp.style.background = t === 'exp' ? C.acc : C.card;
+      tabImp.style.background = t === 'imp' ? C.acc : C.card;
+    };
+    tabExp.onclick = () => setTab('exp'); tabImp.onclick = () => setTab('imp');
+    tabExp.style.flex = tabImp.style.flex = '1';
+    const body = h('div', { display: 'flex', flexDirection: 'column', overflowY: 'auto' }, {},
+      h('div', { display: 'flex', gap: '8px', padding: '8px 10px 0' }, {}, tabExp, tabImp), exportPane, importPane);
 
     const toggle = btn('–'); toggle.style.padding = '2px 10px';
     toggle.onclick = () => { const hide = body.style.display !== 'none'; body.style.display = hide ? 'none' : 'flex'; toggle.textContent = hide ? '+' : '–'; };
